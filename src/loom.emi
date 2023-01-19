@@ -1,0 +1,479 @@
+#include "src/windows.emi";
+#include "src/xed.emi";
+
+compiler_output_name :: "bin/loom.emi";
+
+g_debugeeProcessHandle :s HANDLE;
+g_debugeeThreadHandle  :s HANDLE;
+g_imageBase :s ^void;
+g_stdoutPipe :s HANDLE;
+
+g_windowWidth  :s s16;
+g_windowHeight :s s16;
+
+g_currentCommand :s Command;
+
+g_isProgramRunning :s bool = false;
+g_shouldUpdateThreadContext :s bool = true;
+g_threadContextFrontEnd :s CONTEXT;
+
+g_outputMutex :s HANDLE;
+
+Command :: enum
+{
+	COMMAND_NONE,
+	COMMAND_PAUSE,
+	COMMAND_CONTINUE,
+	COMMAND_SINGLE_STEP,
+	COMMAND_STEP_OUT,
+	COMMAND_SOURCE
+};
+
+SetScreenPosition :: #inline (x: u32, y: u32) {
+	PrintF("\x1b[%;%H", y, x);
+}
+DrawHorizontalLine :: #inline (x: u32, y: u32, width: u32) {
+	PrintF("\x1b[%;%H+", y, x);
+	for (1 .. width - 1) Print("=");
+	Print("+");
+}
+DrawVerticalLine :: #inline (x: u32, y: u32, height: u32) {
+	PrintF("\x1b[%;%H+", y, x);
+	for (1 .. height - 1) PrintF("\x1b[%;%H|", y+i, x);
+	PrintF("\x1b[%;%H+", y+height - 1, x);
+}
+
+MXPrint :: (x: u32, y: u32, str: String)
+{
+	WaitForSingleObject(g_outputMutex, INFINITE);
+	SetScreenPosition(x, y);
+	Print(str);
+	ReleaseMutex(g_outputMutex);
+}
+
+MXPrintF :: (x: u32, y: u32, format: String, ..args)
+{
+	WaitForSingleObject(g_outputMutex, INFINITE);
+	SetScreenPosition(x, y);
+	PrintF(format, args);
+	ReleaseMutex(g_outputMutex);
+}
+
+Main :: (args: [] String) -> s64
+{
+	stdIn := GetStdHandle(STD_INPUT_HANDLE);
+	stdOut := GetStdHandle(STD_OUTPUT_HANDLE);
+
+	xed_tables_init();
+
+	inputBuffer: [512] u8 = ?;
+	inputStr: String = { 0, ^inputBuffer };
+	isCommandEntered := false;
+
+	lastInputStrBuffer: [512] u8 = ?;
+	lastInputStr: String = { 0, ^lastInputStrBuffer };
+
+	// Mutex not to write to output concurrently
+	g_outputMutex = CreateMutexA(null, false, null);
+
+	// Enable virtual sequences
+	consoleMode: DWORD = ?;
+	GetConsoleMode(stdOut, ^consoleMode);
+	SetConsoleMode(stdOut, consoleMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+
+	// Clear the screen
+	Print("\x1b[2J");
+
+	screenInfo: CONSOLE_SCREEN_BUFFER_INFO = ?;
+	GetConsoleScreenBufferInfo(stdOut, ^screenInfo);
+	g_windowWidth  = screenInfo.srWindow.Right - screenInfo.srWindow.Left + 1;
+	g_windowHeight = screenInfo.srWindow.Bottom - screenInfo.srWindow.Top + 1;
+	DrawHorizontalLine(0, 0, g_windowWidth);
+	DrawHorizontalLine(0, g_windowHeight, g_windowWidth);
+	DrawVerticalLine(0, 1, g_windowHeight);
+	DrawVerticalLine(g_windowWidth, 1, g_windowHeight);
+	DrawHorizontalLine(0, g_windowHeight - 3, g_windowWidth);
+	DrawVerticalLine(g_windowWidth - 47, 1, g_windowHeight - 3);
+
+	CreateThread(null, 0, ControlThreadProc, null, 0, null);
+
+	commandTextboxX: u32 = 2;
+	commandTextboxY: u32 = g_windowHeight - 2;
+
+	while true {
+		if !g_isProgramRunning && g_shouldUpdateThreadContext {
+			WaitForSingleObject(g_outputMutex, INFINITE);
+			defer ReleaseMutex(g_outputMutex);
+
+			g_shouldUpdateThreadContext = false;
+			width  := g_windowWidth;
+			height := g_windowHeight;
+			buffer: [32] u8 = ?;
+			SetScreenPosition(width - 45, 2);
+			PrintF("RAX: %  RBX: %",
+					ToHex(g_threadContextFrontEnd.Rax, ^buffer),
+					ToHex(g_threadContextFrontEnd.Rbx, ^buffer + 16));
+			SetScreenPosition(width - 45, 3);
+			PrintF("RCX: %  RDX: %",
+					ToHex(g_threadContextFrontEnd.Rcx, ^buffer),
+					ToHex(g_threadContextFrontEnd.Rdx, ^buffer + 16));
+			SetScreenPosition(width - 45, 4);
+			PrintF("RSP: %  RBP: %",
+					ToHex(g_threadContextFrontEnd.Rsp, ^buffer),
+					ToHex(g_threadContextFrontEnd.Rbp, ^buffer + 16));
+			SetScreenPosition(width - 45, 5);
+			PrintF("RDI: %  RSI: %",
+					ToHex(g_threadContextFrontEnd.Rdi, ^buffer),
+					ToHex(g_threadContextFrontEnd.Rsi, ^buffer + 16));
+			SetScreenPosition(width - 45, 6);
+			PrintF("R8:  %  R9:  %",
+					ToHex(g_threadContextFrontEnd.R8,  ^buffer),
+					ToHex(g_threadContextFrontEnd.R9,  ^buffer + 16));
+			SetScreenPosition(width - 45, 7);
+			PrintF("R10: %  R11: %",
+					ToHex(g_threadContextFrontEnd.R10, ^buffer),
+					ToHex(g_threadContextFrontEnd.R11, ^buffer + 16));
+			SetScreenPosition(width - 45, 8);
+			PrintF("R12: %  R13: %",
+					ToHex(g_threadContextFrontEnd.R12, ^buffer),
+					ToHex(g_threadContextFrontEnd.R13, ^buffer + 16));
+			SetScreenPosition(width - 45, 9);
+			PrintF("R14: %  R15: %",
+					ToHex(g_threadContextFrontEnd.R14, ^buffer),
+					ToHex(g_threadContextFrontEnd.R15, ^buffer + 16));
+			SetScreenPosition(width - 45, 10);
+			PrintF("RIP: %",
+					ToHex(g_threadContextFrontEnd.Rip, ^buffer));
+			SetScreenPosition(width - 45, 11);
+			PrintF("EFLAGS: %",
+					ToHex(g_threadContextFrontEnd.EFlags, ^buffer + 16));
+
+			SetScreenPosition(width - 45, 13);
+			PrintF("DR0: %  DR1: %",
+					ToHex(g_threadContextFrontEnd.Dr0, ^buffer),
+					ToHex(g_threadContextFrontEnd.Dr1, ^buffer + 16));
+			SetScreenPosition(width - 45, 14);
+			PrintF("DR2: %  DR3: %",
+					ToHex(g_threadContextFrontEnd.Dr2, ^buffer),
+					ToHex(g_threadContextFrontEnd.Dr3, ^buffer + 16));
+			SetScreenPosition(width - 45, 15);
+			PrintF("DR6: %  DR7: %",
+					ToHex(g_threadContextFrontEnd.Dr6, ^buffer),
+					ToHex(g_threadContextFrontEnd.Dr7, ^buffer + 16));
+
+			disasmCursor := g_threadContextFrontEnd.Rip;
+			line: u32 = 0;
+			bytes: [16] u8 = ?;
+			chars: [32] u8 = ?;
+			for 0..height - 5 {
+				ReadProcessMemory(g_debugeeProcessHandle, disasmCursor, ^bytes, 16, null);
+
+				xedDecodedInst: xed_decoded_inst_t = ?;
+				dstate64: xed_state_t;
+				dstate64.stack_addr_width = XED_ADDRESS_WIDTH_64b;
+				dstate64.mmode = XED_MACHINE_MODE_LONG_64;
+				xed_decoded_inst_zero_set_mode(^xedDecodedInst, ^dstate64);
+
+				xedError := xed_decode(^xedDecodedInst, ^bytes, 16);
+				if xedError != XED_ERROR_NONE PrintF("Error decoding instruction: %", xedError);
+				ZeroMemory(^chars, 32);
+				disasmSuccess := xed_format_context(XED_SYNTAX_INTEL, ^xedDecodedInst, cast(^s8)^chars, 32,
+						disasmCursor, null, null);
+				if disasmSuccess {
+					instructionString := CStrToString(^chars);
+					SetScreenPosition(2, 2 + line);
+					hexBuf: [16] u8 = ?;
+					PrintF("%  %", ToHex(disasmCursor, ^hexBuf), instructionString);
+					// Clear the rest
+					for instructionString.size..width - 70 Print(" ");
+					disasmCursor += xedDecodedInst._decoded_length;
+					line += 1;
+				}
+				else break;
+			}
+		}
+
+		numberOfEvents: u32 = ?;
+		GetNumberOfConsoleInputEvents(stdIn, ^numberOfEvents);
+		if numberOfEvents > 0 {
+			WaitForSingleObject(g_outputMutex, INFINITE);
+			defer ReleaseMutex(g_outputMutex);
+			// Set cursor at the end of the command
+			SetScreenPosition(commandTextboxX + cast(u32)inputStr.size, commandTextboxY);
+
+			inputRecord: INPUT_RECORD = ?;
+			readCount: u32 = ?;
+			if ReadConsoleInputA(stdIn, ^inputRecord, 1, ^readCount) {
+				if inputRecord.EventType == KEY_EVENT && inputRecord.Event.KeyEvent.bKeyDown {
+					if inputRecord.Event.KeyEvent.wVirtualKeyCode == VK_RETURN
+						isCommandEntered = true;
+					else if inputRecord.Event.KeyEvent.wVirtualKeyCode == VK_BACK {
+						Print("\x08 \x08");
+						inputStr.size -= 1;
+					}
+					else if inputRecord.Event.KeyEvent.uChar.AsciiChar >= 32 {
+						printableChar := cast(u8)inputRecord.Event.KeyEvent.uChar.AsciiChar;
+						inputBuffer[inputStr.size] = printableChar;
+						Print({ 1, ^printableChar });
+						inputStr.size += 1;
+					}
+				}
+			}
+		}
+
+		if isCommandEntered {
+			// Clear command line
+			SetScreenPosition(commandTextboxX, commandTextboxY);
+			for (0..g_windowWidth - 2) Print(" ");
+
+			commandStr: String = ?;
+			if inputStr.size == 0 && lastInputStr.size > 0
+				// Repeat last command
+				commandStr = lastInputStr;
+			else
+				commandStr = inputStr;
+
+			if StringEquals(commandStr, "quit") || StringEquals(commandStr, "q")
+				break;
+			else if StringEquals(commandStr, "pause")
+				g_currentCommand = COMMAND_PAUSE;
+			else if StringEquals(commandStr, "continue") || StringEquals(commandStr, "cont")
+				g_currentCommand = COMMAND_CONTINUE;
+			else if StringEquals(commandStr, "step") || StringEquals(commandStr, "s")
+				g_currentCommand = COMMAND_SINGLE_STEP;
+			else if StringEquals(commandStr, "stepout") || StringEquals(commandStr, "return")
+				g_currentCommand = COMMAND_STEP_OUT;
+			else if StringEquals(commandStr, "source")
+				g_currentCommand = COMMAND_SOURCE;
+			else
+				MXPrintF(commandTextboxX, commandTextboxY, "Unknown command \"%\"", commandStr);
+
+			if (inputStr.size > 0) {
+				// Remember last command
+				CopyMemory(lastInputStr.data, inputStr.data, inputStr.size);
+				lastInputStr.size = inputStr.size;
+				// Clear
+				inputStr.size = 0;
+			}
+			isCommandEntered = false;
+		}
+	}
+
+	return 0;
+}
+
+CStrToString :: (cstr: ^u8) -> String
+{
+	result: String = { 0, cstr };
+	while @cstr != 0 {
+		result.size += 1;
+		cstr += 1;
+	}
+	return result;
+}
+
+StringEquals :: (a: String, b: String) -> bool
+{
+	if (a.size != b.size) return false;
+	for 0..a.size {
+		if a[i] != b[i] return false;
+	}
+	return true;
+}
+
+ControlThreadProc :: #convention(win64) (param: ^void) -> DWORD
+{
+	// Create stdout pipe
+	stdoutWritePipe: HANDLE = ?;
+	CreatePipe(^g_stdoutPipe, ^stdoutWritePipe, null, 0);
+	SetHandleInformation(g_stdoutPipe, HANDLE_FLAG_INHERIT, 0);
+
+	// Create debugee process
+	processInfo: PROCESS_INFORMATION = ?;
+	startupInfo: STARTUPINFOA;
+	startupInfo.cb = cast(u32)sizeof(STARTUPINFOA);
+	startupInfo.hStdOutput = stdoutWritePipe;
+	startupInfo.dwFlags |= STARTF_USESTDHANDLES;
+	applicationName := #cstr "bin/testprogram.exe";
+	applicationPath := #cstr "bin";
+	success := CreateProcessA(applicationName, null, null, null, false, DEBUG_PROCESS |
+					 0, null, null, ^startupInfo, ^processInfo);
+	if !success {
+		PrintF("Error creating process: %", GetLastError());
+		ExitProcess(1);
+	}
+	g_debugeeProcessHandle = processInfo.hProcess;
+	g_debugeeThreadHandle  = processInfo.hThread;
+
+	// We don't need the write pipe
+	CloseHandle(stdoutWritePipe);
+
+	latestDebugEvent: DEBUG_EVENT;
+
+	threadContext: CONTEXT = ?;
+	threadContext.ContextFlags = CONTEXT_ALL;
+
+	shouldContinue: bool = true;
+
+	outputTextboxX: u32 = 2;
+	outputTextboxY: u32 = g_windowHeight - 1;
+	outputTextboxWidth: u32 = g_windowWidth - 2;
+
+	running := true;
+	while running {
+		// Process requests from front-end
+		// @Todo: lock xchg
+		command := g_currentCommand;
+		g_currentCommand = COMMAND_NONE;
+		if command != COMMAND_NONE {
+			// Clear output
+			WaitForSingleObject(g_outputMutex, INFINITE);
+			SetScreenPosition(outputTextboxX, outputTextboxY);
+			for 0..outputTextboxWidth Print("*");
+			ReleaseMutex(g_outputMutex);
+		}
+
+		success := GetThreadContext(g_debugeeThreadHandle, ^threadContext);
+		if !success {
+			MXPrintF(outputTextboxX, outputTextboxY, "Error getting thread context: %", GetLastError());
+			continue;
+		}
+
+		if command == COMMAND_PAUSE {
+			shouldContinue = false;
+			g_isProgramRunning = false;
+			SuspendThread(g_debugeeThreadHandle);
+			MXPrint(outputTextboxX, outputTextboxY, "Pause");
+
+			// Update front-end context
+			success = GetThreadContext(g_debugeeThreadHandle, ^threadContext);
+			if success {
+				g_shouldUpdateThreadContext = true;
+				g_threadContextFrontEnd = threadContext;
+			}
+			else
+				MXPrintF(outputTextboxX, outputTextboxY, "Error getting thread context: %", GetLastError());
+		}
+		else if command == COMMAND_CONTINUE {
+			threadContext.EFlags &= ~0x100;
+			success := SetThreadContext(g_debugeeThreadHandle, ^threadContext);
+			if (success) {
+				shouldContinue = true;
+				g_isProgramRunning = true;
+				ResumeThread(g_debugeeThreadHandle);
+			}
+			else
+				MXPrintF(outputTextboxX, outputTextboxY, "Error setting thread context: %", GetLastError());
+		}
+		else if command == COMMAND_SINGLE_STEP {
+			threadContext.EFlags |= 0x100;
+			success := SetThreadContext(g_debugeeThreadHandle, ^threadContext);
+			if (success) {
+				shouldContinue = true;
+				ResumeThread(g_debugeeThreadHandle);
+			}
+			else
+				MXPrintF(outputTextboxX, outputTextboxY, "Error setting thread context: %", GetLastError());
+		}
+		else if command == COMMAND_STEP_OUT {
+			returnAddrPtr := threadContext.Rbp + 8;
+			returnAddr: u64 = ?;
+			ReadProcessMemory(g_debugeeProcessHandle, returnAddrPtr, ^returnAddr, 8, null);
+			MXPrintF(outputTextboxX, outputTextboxY, "Set breakpoint on return address: %",
+					cast(^void)returnAddr);
+			threadContext.Dr0 = returnAddr;
+			threadContext.Dr7 |= 1;
+			threadContext.Dr7 &= ~0xF0000;
+			success := SetThreadContext(g_debugeeThreadHandle, ^threadContext);
+			if (success) {
+				shouldContinue = true;
+				ResumeThread(g_debugeeThreadHandle);
+			}
+			else
+				MXPrintF(outputTextboxX, outputTextboxY, "Error setting thread context: %", GetLastError());
+		}
+		else if command == COMMAND_SOURCE {
+			rel: ^void = threadContext.Rip - g_imageBase;
+			MXPrintF(outputTextboxX, outputTextboxY, "Image base: %", g_imageBase);
+			MXPrintF(outputTextboxX, outputTextboxY, "Relative address: %", rel);
+		}
+
+		// Process debug events
+		debugEvent: DEBUG_EVENT = ?;
+		if WaitForDebugEvent(^debugEvent, 0) {
+			latestDebugEvent = debugEvent;
+
+			if (debugEvent.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
+				imageNamePtr := debugEvent.u.CreateProcessInfo.lpImageName;
+				if imageNamePtr != null {
+					imageName: ^u8;
+					ReadProcessMemory(g_debugeeProcessHandle, imageNamePtr, ^imageName, 8, null);
+					if imageName != null {
+						buffer: [256] u8;
+						ReadProcessMemory(g_debugeeProcessHandle, imageName, ^buffer, 256, null);
+						MXPrintF(outputTextboxX, outputTextboxY, "Created process %", CStrToString(^buffer));
+					}
+				}
+				else {
+					MXPrint(outputTextboxX, outputTextboxY, "Created process");
+				}
+				g_imageBase = debugEvent.u.CreateProcessInfo.lpBaseOfImage;
+				//MXPrintF(outputTextboxX, outputTextboxY, "Image base %", g_imageBase);
+			}
+			else if (debugEvent.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
+				exceptionCode := debugEvent.u.Exception.ExceptionRecord.ExceptionCode;
+				if exceptionCode == EXCEPTION_BREAKPOINT {
+					MXPrint(outputTextboxX, outputTextboxY, "Breakpoint");
+				}
+				else if exceptionCode == EXCEPTION_SINGLE_STEP {
+					MXPrint(outputTextboxX, outputTextboxY, "Single step");
+					// Remove DR0 hardware breakpoint if we hit it
+					/*
+					if threadContext.Dr6 & 1 {
+						threadContext.Dr7 &= ~1;
+						success := SetThreadContext(g_debugeeThreadHandle, ^threadContext);
+						if (success) {
+							g_shouldUpdateThreadContext = true;
+							g_threadContextFrontEnd = threadContext;
+						}
+						else
+							MXPrintF(outputTextboxX, outputTextboxY, "Error setting thread context: %", GetLastError());
+					}*/
+				}
+				else if exceptionCode == EXCEPTION_ACCESS_VIOLATION {
+					MXPrintF(outputTextboxX, outputTextboxY, "Access violation on address %",
+							cast(^void)debugEvent.u.Exception.ExceptionRecord.ExceptionInformation[1]);
+				}
+				else
+					MXPrintF(outputTextboxX, outputTextboxY, "Exception debug event: %", debugEvent.u.Exception);
+				shouldContinue = false;
+
+				success = GetThreadContext(g_debugeeThreadHandle, ^threadContext);
+				if success {
+					g_shouldUpdateThreadContext = true;
+					g_threadContextFrontEnd = threadContext;
+				}
+				else {
+					MXPrintF(outputTextboxX, outputTextboxY, "Error getting thread context: %", GetLastError());
+					continue;
+				}
+			}
+			else if (debugEvent.dwDebugEventCode == OUTPUT_DEBUG_STRING_EVENT) {
+				debugString: String = ?;
+				debugString.size = debugEvent.u.DebugString.nDebugStringLength;
+				debugString.data = cast(^u8)VirtualAlloc(null, debugString.size, MEM_RESERVE | MEM_COMMIT,
+						PAGE_READWRITE);
+				ReadProcessMemory(g_debugeeProcessHandle, debugEvent.u.DebugString.lpDebugStringData,
+						debugString.data, debugString.size, null);
+				MXPrintF(outputTextboxX, outputTextboxY, "Debug string: \"%\"", debugString);
+				VirtualFree(debugString.data, debugString.size, MEM_RELEASE);
+			}
+		}
+
+		if shouldContinue
+			ContinueDebugEvent(latestDebugEvent.dwProcessId, latestDebugEvent.dwThreadId, DBG_CONTINUE);
+	}
+	TerminateProcess(g_debugeeProcessHandle, 0);
+
+	return 0;
+}

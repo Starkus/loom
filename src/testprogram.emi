@@ -1,0 +1,24 @@
+#include "core/windows.emi";
+
+compiler_output_name :: "bin/testprogram.emi";
+
+Main :: (args: [] String) -> s64
+{
+	i := 0;
+	// @Hack: infinite loops mess up the register allocation, but imagine this is a while true
+	while __ImageBase != 0 {
+		Print("Running... ");
+		if i == 0
+			Print("\\");
+		else if i == 1
+			Print("|");
+		else if i == 2
+			Print("/");
+		else if i == 3
+			Print("-");
+		Print("\n");
+		i = (i + 1) & 3;
+		Sleep(500);
+	}
+	return 0;
+}

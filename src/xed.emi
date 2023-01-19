@@ -1,0 +1,326 @@
+#linklib "external/xed";
+
+strcmp :: #export #convention(win64) (a: ^s8, b: ^s8) -> s64
+{
+	while @a && @b {
+		if @a < @b return -1;
+		if @a > @b return  1;
+		a += 1;
+		b += 1;
+	}
+	if @a == 0 && @b != 0
+		return -1;
+	if @a != 0 && @b == 0
+		return  1;
+	return 0;
+}
+
+strlen :: #export #convention(win64) (str: ^s8) -> s64
+{
+	i := 0;
+	while @str {
+		i += 1;
+		str += 1;
+	}
+	return i;
+}
+
+strcat_s :: #export #convention(win64) (dst: ^s8, count: u64, src: ^s8) -> s64
+{
+	end := dst + count;
+	while @dst {
+		dst += 1;
+		if dst >= end return 1;
+	}
+	while @src {
+		@dst = @src;
+		dst += 1;
+		src += 1;
+		if dst >= end return 1;
+	}
+	return 0;
+}
+
+memset :: #export #convention(win64) (dst: ^void, byte: u8, count: u64)
+{
+	for 0..count @(cast(^u8)dst + i) = byte;
+}
+
+__security_cookie :: #export #convention(win64) () {}
+__security_check_cookie :: #export #convention(win64) () {}
+__report_rangecheckfailure :: #export #convention(win64) () {}
+__GSHandlerCheck :: #export #convention(win64) () {}
+__chkstk :: #export #convention(win64) () {}
+__stdio_common_vfprintf :: #export #convention(win64) () {}
+__acrt_iob_func :: #export #convention(win64) () {}
+abort :: #export #convention(win64) () { ExitProcess(1); }
+
+XED_ENCODE_ORDER_MAX_OPERANDS :: 5;
+
+xed_error_enum_t :: enum
+{
+	XED_ERROR_NONE, ///< There was no error
+	XED_ERROR_BUFFER_TOO_SHORT, ///< There were not enough bytes in the given buffer
+	XED_ERROR_GENERAL_ERROR, ///< XED could not decode the given instruction
+	XED_ERROR_INVALID_FOR_CHIP, ///< The instruciton is not valid for the specified chip
+	XED_ERROR_BAD_REGISTER, ///< XED could not decode the given instruction because an invalid register encoding was used.
+	XED_ERROR_BAD_LOCK_PREFIX, ///< A lock prefix was found where none is allowed.
+	XED_ERROR_BAD_REP_PREFIX, ///< An F2 or F3 prefix was found where none is allowed.
+	XED_ERROR_BAD_LEGACY_PREFIX, ///< A 66, F2 or F3 prefix was found where none is allowed.
+	XED_ERROR_BAD_REX_PREFIX, ///< A REX prefix was found where none is allowed.
+	XED_ERROR_BAD_EVEX_UBIT, ///< An illegal value for the EVEX.U bit was present in the instruction.
+	XED_ERROR_BAD_MAP, ///< An illegal value for the MAP field was detected in the instruction.
+	XED_ERROR_BAD_EVEX_V_PRIME, ///< EVEX.V'=0 was detected in a non-64b mode instruction.
+	XED_ERROR_BAD_EVEX_Z_NO_MASKING, ///< EVEX.Z!=0 when EVEX.aaa==0
+	XED_ERROR_NO_OUTPUT_POINTER, ///< The output pointer for xed_agen was zero
+	XED_ERROR_NO_AGEN_CALL_BACK_REGISTERED, ///< One or both of the callbacks for xed_agen were missing.
+	XED_ERROR_BAD_MEMOP_INDEX, ///< Memop indices must be 0 or 1.
+	XED_ERROR_CALLBACK_PROBLEM, ///< The register or segment callback for xed_agen experienced a problem
+	XED_ERROR_GATHER_REGS, ///< The index, dest and mask regs for AVX2 gathers must be different.
+	XED_ERROR_INSTR_TOO_LONG, ///< Full decode of instruction would exeed 15B.
+	XED_ERROR_INVALID_MODE, ///< The instruction was not valid for the specified mode
+	XED_ERROR_BAD_EVEX_LL, ///< EVEX.LL must not ==3 unless using embedded rounding
+	XED_ERROR_BAD_REG_MATCH, ///< Source registers must not match the destination register for this instruction.
+	XED_ERROR_LAST
+};
+
+xed_machine_mode_enum_t :: enum
+{
+	XED_MACHINE_MODE_INVALID,
+	XED_MACHINE_MODE_LONG_64,
+	XED_MACHINE_MODE_LONG_COMPAT_32,
+	XED_MACHINE_MODE_LONG_COMPAT_16,
+	XED_MACHINE_MODE_LEGACY_32,
+	XED_MACHINE_MODE_LEGACY_16,
+	XED_MACHINE_MODE_REAL_16,
+	XED_MACHINE_MODE_REAL_32,
+	XED_MACHINE_MODE_LAST
+};
+
+xed_address_width_enum_t :: enum
+{
+	XED_ADDRESS_WIDTH_INVALID = 0,
+	XED_ADDRESS_WIDTH_16b = 2,
+	XED_ADDRESS_WIDTH_32b = 4,
+	XED_ADDRESS_WIDTH_64b = 8,
+	XED_ADDRESS_WIDTH_LAST
+};
+
+xed_syntax_enum_t :: enum
+{
+	XED_SYNTAX_INVALID,
+	XED_SYNTAX_XED,
+	XED_SYNTAX_ATT,
+	XED_SYNTAX_INTEL,
+	XED_SYNTAX_LAST
+};
+
+xed_state_t :: struct
+{
+	mmode: xed_machine_mode_enum_t;
+	stack_addr_width: xed_address_width_enum_t;
+};
+
+xed_decoded_inst_t :: struct
+{
+	_operands: xed_operand_storage_t;
+
+	_operand_order: [XED_ENCODE_ORDER_MAX_OPERANDS] u8;
+	_n_operand_order: u8; 
+	_decoded_length: u8;
+
+	_inst: ^xed_inst_t;
+
+	_byte_array: union {
+		_enc: ^u8;
+		_dec: ^u8;
+	};
+
+	u: union {
+		user_data: u64;
+		ild_data: xed_ild_vars_t;
+		ev: ^void;
+	};
+};
+
+xed_inst_t :: struct
+{
+	_noperands: u8; 
+	_cpl: u8;
+	_flag_complex: u8;
+	_exceptions: u8;
+	_flag_info_index: u16; 
+	_iform_enum: u16;
+	_operand_base: u16; 
+	_attributes: u16;
+};
+
+xed_ild_vars_t :: union
+{
+	i: u32;
+	s: struct {
+		has_modrm: u8;
+		has_disp: u8;
+		has_imm: u8;
+    };
+};
+
+xed_operand_storage_t :: struct
+{
+	agen: u8;
+	amd3dnow: u8;
+	asz: u8;
+	bcrc: u8;
+	cet: u8;
+	cldemote: u8;
+	df32: u8;
+	df64: u8;
+	dummy: u8;
+	encoder_preferred: u8;
+	encode_force: u8;
+	has_sib: u8;
+	ild_f2: u8;
+	ild_f3: u8;
+	imm0: u8;
+	imm0signed: u8;
+	imm1: u8;
+	lock: u8;
+	lzcnt: u8;
+	mem0: u8;
+	mem1: u8;
+	modep5: u8;
+	modep55c: u8;
+	mode_first_prefix: u8;
+	mode_short_ud0: u8;
+	mpxmode: u8;
+	must_use_evex: u8;
+	needrex: u8;
+	need_sib: u8;
+	norex: u8;
+	no_evex: u8;
+	no_vex: u8;
+	osz: u8;
+	out_of_bytes: u8;
+	p4: u8;
+	prefix66: u8;
+	ptr: u8;
+	realmode: u8;
+	relbr: u8;
+	rex: u8;
+	rexb: u8;
+	rexr: u8;
+	rexrr: u8;
+	rexw: u8;
+	rexx: u8;
+	sae: u8;
+	tzcnt: u8;
+	ubit: u8;
+	using_default_segment0: u8;
+	using_default_segment1: u8;
+	vexdest3: u8;
+	vexdest4: u8;
+	vex_c4: u8;
+	wbnoinvd: u8;
+	zeroing: u8;
+	default_seg: u8;
+	easz: u8;
+	eosz: u8;
+	first_f2f3: u8;
+	has_modrm: u8;
+	last_f2f3: u8;
+	llrc: u8;
+	mod: u8;
+	mode: u8;
+	rep: u8;
+	sibscale: u8;
+	smode: u8;
+	vex_prefix: u8;
+	vl: u8;
+	hint: u8;
+	mask: u8;
+	reg: u8;
+	rm: u8;
+	roundc: u8;
+	seg_ovd: u8;
+	sibbase: u8;
+	sibindex: u8;
+	srm: u8;
+	vexdest210: u8;
+	vexvalid: u8;
+	error: u8;
+	esrc: u8;
+	map: u8;
+	nelem: u8;
+	scale: u8;
+	bcast: u8;
+	need_memdisp: u8;
+	chip: u8;
+	brdisp_width: u8;
+	disp_width: u8;
+	ild_seg: u8;
+	imm1_bytes: u8;
+	imm_width: u8;
+	max_bytes: u8;
+	modrm_byte: u8;
+	nominal_opcode: u8;
+	nprefixes: u8;
+	nrexes: u8;
+	nseg_prefixes: u8;
+	pos_disp: u8;
+	pos_imm: u8;
+	pos_imm1: u8;
+	pos_modrm: u8;
+	pos_nominal_opcode: u8;
+	pos_sib: u8;
+	uimm1: u8;
+	base0: u16;
+	base1: u16;
+	element_size: u16;
+	index: u16;
+	outreg: u16;
+	reg0: u16;
+	reg1: u16;
+	reg2: u16;
+	reg3: u16;
+	reg4: u16;
+	reg5: u16;
+	reg6: u16;
+	reg7: u16;
+	reg8: u16;
+	reg9: u16;
+	seg0: u16;
+	seg1: u16;
+	iclass: u16;
+	mem_width: u16;
+	disp: u64;
+	uimm0: u64;
+};
+
+xed_tables_init :: #external #convention(win64) ();
+
+xed_decoded_inst_zero_set_mode :: #external #convention(win64) (
+		p: ^xed_decoded_inst_t,
+		dstate: ^xed_state_t
+		);
+
+/* This one is not linking for some reason.
+xed_decoded_inst_get_length :: #external #convention(win64) (
+		p: ^xed_decoded_inst_t,
+		) -> u64;
+*/
+
+xed_decode :: #external #convention(win64) (
+		xedd: ^xed_decoded_inst_t,
+		itext: ^u8,
+		bytes: u64
+		) -> xed_error_enum_t;
+
+xed_format_context :: #external #convention(win64) (
+		syntax: xed_syntax_enum_t,
+		xedd: ^xed_decoded_inst_t,
+		out_buffer: ^s8,
+		buffer_len: s32,
+		runtime_instruction_address: u64,
+		context: ^void,
+		symbolic_callback: ^void
+		) -> bool;
